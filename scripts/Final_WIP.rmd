@@ -1,0 +1,195 @@
+---
+title: "Final_Projet"
+output: html_document
+date: "2025-11-26"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+#importing libraries
+library(tidyverse)
+library(tidyr)
+library(dplyr)
+library(magrittr)
+library(WDI)
+library(lubridate)
+library(EpiNow2)
+library(zoo)
+library(ggplot2)
+
+
+vignette("EpiNow2")
+
+```
+
+
+```{r pressure, echo=FALSE}
+deaths_100k <- read_csv('/rt-estimates-covid/data/export_country_per_100k.csv')
+wiki_codes <- read_csv('/rt-estimates-covid/data/wikipedia-iso-country-codes.csv')
+
+colnames(wiki_codes)[colnames(wiki_codes) == "English short name lower case"] <- "Country"
+
+deaths_with_countries <- deaths_100k %>%
+  left_join(wiki_codes, join_by('iso3c' == 'Alpha-3 code'))
+
+US_deaths <- deaths_with_countries %>%
+  filter(iso3c == 'USA') %>%
+  select(date, estimated_daily_excess_deaths_per_100k)
+
+
+```
+
+
+```{r}
+
+
+prepare_excess_deaths <- function(df) {
+  
+  df_clean <- df %>%
+    arrange(date) %>%
+    group_by(Country) %>%
+    mutate(
+      daily_total_raw = (estimated_daily_excess_deaths_per_100k * population) / 100000) %>%
+    complete(date = seq.Date(min(date), max(date), by = "day")) %>%
+    mutate(daily_total_smooth = na.approx(daily_total_raw, na.rm = FALSE)) %>%
+    fill(daily_total_smooth, .direction = "downup") %>%
+    select(date, confirm = daily_total_smooth, Country) %>%
+    mutate(confirm = as.integer(pmax(0, ceiling(confirm)))) %>%
+    ungroup()
+  
+  return(df_clean)
+}
+
+
+daily_deaths_100k <- prepare_excess_deaths(US_deaths)
+
+daily_deaths_100k %>%
+  ggplot(mapping = aes(x=date, y = confirm)) +
+  geom_line()
+
+death_delay <- LogNormal(mean = 22, sd = 12, max = 60) #this needs better empirical justification than what I'm providing now
+
+gen_time <- Gamma( ##double check against Ferretti et al paper
+  mean = 5.0,
+  sd = 1.9,
+  max = 20
+)
+
+estimates <- epinow(
+  data = daily_deaths_100k,
+  generation_time = gt_opts(gen_time),
+  delays = delay_opts(death_delay),
+  rt = rt_opts(prior = LogNormal(mean = 2, sd = 0.2)),
+  stan = stan_opts(cores = 4),
+  verbose = interactive()
+)
+
+plot(estimates)
+
+
+rt_results <- estimates$estimates$summarised
+
+rt_data <- rt_results %>% 
+  filter(variable == "R")
+
+head(rt_data)
+
+rt_data %>%
+  ggplot(mapping = aes(x=date, y = median)) +
+  geom_line()
+```
+
+
+```{r}
+deaths_2020 <- deaths_with_countries %>%
+  filter(year(date)<as.Date(2021))
+
+prepped_deaths <- prepare_excess_deaths(deaths_2020)
+
+write_csv(prepped_deaths, "processed_deaths.csv")
+
+?write_csv
+
+process_deaths_by_country <- function(df, cutoff) {
+
+  country_list <- unique(df$Country)
+  dir.create("rt_results", showWarnings = FALSE)
+  
+
+  for(i in 1:cutoff) {
+    current_country <- country_list[i]
+    safe_name <- gsub(" ", "_", current_country)
+    message(paste("Processing", i, "of", cutoff, ":", current_country))
+    file_path <- file.path("rt_results", paste0("rt_", safe_name, ".csv"))
+    if(file.exists(file_path)) {
+      message("  -> Skipping (File exists)")
+      next
+    }
+
+    df_by_country <- df %>%
+      filter(Country == current_country) %>% 
+      select(date, confirm)
+    
+    if(sum(df_by_country$confirm) < 50) {
+      message("  -> Skipping (Insufficient data)")
+      next 
+    }
+    
+    tryCatch({
+      estimates <- epinow(
+        data = df_by_country,
+        generation_time = generation_time_opts(gen_time),
+        delays = delay_opts(death_delay),
+        rt = rt_opts(prior = LogNormal(mean = 2, sd = 0.2)), ##not confident in prior SD - EpiNow vignette used .2 but seems tight
+        stan = stan_opts(cores = 4),
+        verbose = FALSE
+      )
+      
+      summary_df <- estimates$estimates$summarised %>%
+        mutate(Country = current_country)
+      write_csv(summary_df, file_path)
+      
+    }, error = function(e) {
+      message(paste("  -> FAILED on:", current_country))
+      message(e)
+    })
+    
+    # Clean RAM
+    gc()
+  }
+  
+  message("Batch processing complete.")
+}
+
+
+process_deaths_by_country(prepped_deaths, cutoff = 1)
+
+list.files("rt_results")
+
+afg <- read_csv("~/rt_results/rt_Afghanistan.csv")
+
+View(afg)
+
+rt_results <- afg$estimates$summarised
+
+rt_data <- afg %>% 
+  filter(variable == "R")
+
+head(rt_data)
+
+rt_data %>%
+  ggplot(mapping = aes(x=date, y = mean)) +
+  geom_line()
+```
+
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
