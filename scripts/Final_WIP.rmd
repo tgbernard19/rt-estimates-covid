@@ -1,5 +1,5 @@
 ---
-title: "Final_Projet"
+title: "Final_Project"
 output: html_document
 date: "2025-11-26"
 ---
@@ -10,31 +10,33 @@ knitr::opts_chunk$set(echo = TRUE)
 
 ## R Markdown
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
-
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+First off, let's import all of the packages we'll need!
 
 ```{r cars}
 #importing libraries
 library(tidyverse)
 library(tidyr)
-library(dplyr)
 library(magrittr)
 library(WDI)
 library(lubridate)
 library(EpiNow2)
 library(zoo)
 library(ggplot2)
-
-
-vignette("EpiNow2")
+library(readr)
+library(stringr)
+library(here)
+library(scales)
+library(patchwork)
 
 ```
 
+Next, we're going to read in our data. Here, I load in the excess death data as computed by the [Economist](https://github.com/TheEconomist/covid-19-the-economist-global-excess-deaths-model/blob/main/README.md). Given that they only list the iso3c abbreviations for countries, I also join their dataframe to a [wikipedia mapping](https://gist.github.com/radcliff/f09c0f88344a7fcef373) of ISO labels to country names. 
+
+First, we'll load them in. They're both available at the links above as well as in my GitHub repository for this project. Next, we're going to join and display our data to get a sense of what it looks like.
 
 ```{r pressure, echo=FALSE}
-deaths_100k <- read_csv('/rt-estimates-covid/data/export_country_per_100k.csv')
-wiki_codes <- read_csv('/rt-estimates-covid/data/wikipedia-iso-country-codes.csv')
+deaths_100k <- read_csv(here("data", "export_country_per_100k.csv"))
+wiki_codes <- read_csv(here("data", "wikipedia-iso-country-codes.csv"))
 
 colnames(wiki_codes)[colnames(wiki_codes) == "English short name lower case"] <- "Country"
 
@@ -43,15 +45,21 @@ deaths_with_countries <- deaths_100k %>%
 
 US_deaths <- deaths_with_countries %>%
   filter(iso3c == 'USA') %>%
+  filter(year(date)<as.Date(2021)) %>%
   select(date, estimated_daily_excess_deaths_per_100k)
 
+US_deaths %>%
+    ggplot(mapping = aes(x=date, y = estimated_daily_excess_deaths_per_100k)) +
+  geom_line() + 
+    labs(title = "US Excess Deaths", x = "Time", y = "Deaths ", x = NULL) +
+  theme_light()
 
 ```
+That looks approximately like what we would expect - a significant bump in April, a fall after lockdown was initiated, and a climb back up as winter began. But note the strangeness of the y-axis - the Economist reports the number of excess deaths per 100,000 citizens, which is a difficult metric to form an intuition around. We'll account for that in our next step.
 
+Now that we know that our data looks approximately how we expect, we write a function to do that for our whole dataset. The downstream application we're interested in computing is the effective rate of transmission by time and by country. To do that, we need to make sure it's formatted in such a way that EpiNow2 - the library we'll use to make that calculation - can accept it. We therefore first get the total number of deaths (non-normalized), then do a linear interpolation step to increase the resolution to a per day total.
 
 ```{r}
-
-
 prepare_excess_deaths <- function(df) {
   
   df_clean <- df %>%
@@ -63,26 +71,74 @@ prepare_excess_deaths <- function(df) {
     mutate(daily_total_smooth = na.approx(daily_total_raw, na.rm = FALSE)) %>%
     fill(daily_total_smooth, .direction = "downup") %>%
     select(date, confirm = daily_total_smooth, Country) %>%
-    mutate(confirm = as.integer(pmax(0, ceiling(confirm)))) %>%
+    mutate(confirm = as.integer(pmax(0, ceiling(confirm)))+1) %>%
     ungroup()
   
   return(df_clean)
+  
 }
+```
+Let's see how it worked!
 
+```{r}
+daily_deaths_100k <- prepare_excess_deaths(deaths_with_countries) %>%
+  filter(date < as.Date("2021-01-01"))
 
-daily_deaths_100k <- prepare_excess_deaths(US_deaths)
+write_csv(daily_deaths_100k, here("data", "processed_deaths.csv"))
+
+prepped_deaths <- daily_deaths_100k
 
 daily_deaths_100k %>%
+  filter(Country == 'United States') %>%
   ggplot(mapping = aes(x=date, y = confirm)) +
-  geom_line()
+  geom_line() +
+   labs(
+    title = "Excess US Deaths",
+    x = "Time",
+    y = "Deaths"
+  )
+```
+Looks good! The peaks correspond to what we know about the pandemic in 2020, which is what we're concerned with. 
 
-death_delay <- LogNormal(mean = 22, sd = 12, max = 60) #this needs better empirical justification than what I'm providing now
+To elaborate: we're going to limit the scope of our data to before 2020 because vaccines get introduced thereafter. We're interested in the effectiveness of non-pharmaceutical interventions and the vaccines are... well, a pharmaceutical intervention.
 
-gen_time <- Gamma( ##double check against Ferretti et al paper
+
+The engine of EpiNow2 are these two definitions below. They're both borrowed from epidemiological papers that empirically estimated these functions for COVID-19. The death delay (death_delay) describes how long someone takes to go from infection to death, and the generation time (gen_time) when someone is at their most infectious when infected with COVID-19. Intuitively, you can think of them as useful for solving the following problem: deaths are fairly easy to estimate using a method like the Economist's, but even in the countries with the most advanced, state-of-the-art monitoring, we never get to observe infections! Only cases. So, what we do to get around that is chain backwards to figure out the likely number of infections. If we know when someone died, how long people usually take to die when infected, and how infectious people are on different days of illness, then we can figure out when most infections were likely to have occurred.
+
+```{r}
+death_delay <- LogNormal(mean = 22, sd = 12, max = 60) #some reasonable variance in paper's (https://pmc.ncbi.nlm.nih.gov/articles/PMC8528322/) but this seems like a fair selection? Charlie's thoughts? 
+
+gen_time <- Gamma(# (https://www.science.org/doi/10.1126/science.abb6936)
   mean = 5.0,
   sd = 1.9,
   max = 20
 )
+```
+
+This takes a few hours to run for each country if we do it for the whole pandemic. Because of the post-2020 concern and scaling issues, we'll also go ahead and filter our data to the top 20 countries by death burden.
+```{r}
+prepped_deaths %>%
+  group_by(Country) %>%
+  summarise(total = sum(confirm)) %>%
+  arrange(desc(total)) %>%
+  top_n(20) %>%
+  select(Country)
+
+top_20_by_deaths <- prepped_deaths %>%
+  group_by(Country) %>%
+  summarise(total = sum(confirm)) %>%
+  arrange(desc(total)) %>%
+  top_n(20) %>%
+  select(Country) %>%
+  slice()
+  
+write_csv(top_20_by_deaths, "top_20_by_deaths.csv")
+```
+
+
+Time to pipe this all into EpiNow2!
+
+```{r, eval = FALSE}
 
 estimates <- epinow(
   data = daily_deaths_100k,
@@ -92,104 +148,409 @@ estimates <- epinow(
   stan = stan_opts(cores = 4),
   verbose = interactive()
 )
+```
 
-plot(estimates)
+I've gone ahead now and computed those for the top 20 countries with the highest death burden in the Economist's dataset. Now, we'll read the US' data back in and have a look.
 
-
-rt_results <- estimates$estimates$summarised
+```{r}
+rt_results <- read_csv(here("rt_results", "rt_United_States.csv"))
 
 rt_data <- rt_results %>% 
   filter(variable == "R")
 
-head(rt_data)
-
 rt_data %>%
   ggplot(mapping = aes(x=date, y = median)) +
-  geom_line()
+  geom_line() + 
+    labs(title = "United States: Effective Rate of Transmission vs. Time", x = "Time", y = "Rt ", x = NULL) +
+  theme_light()
+```
+It looks pretty good, but you'll also observe some strange behavior here: COVID transmission was dramatic even in January / February according to our model! That's not biologically plausible, and reflects an artifact of our data and method rather than biological reality. We're going to address that in a minute.
+
+First things first, though. What I've also done is use a common technique in biological data - dimensionality reduction - to identify the 'clusters,' or groups, implicit in our data. Basically, you use a linear algebra technique to visualize your data in 2 or 3 dimensions, then see how close together the points are. The R version of the library I needed to use for my time series isn't well-supported, so I did that all in python. The script for that will be available for review, too. Suffice it to say, what we will read back in is an assignment of different countries to different clusters based on how their response to COVID in the first year of the pandemic looked. Then, we'll concatenate all of the files I generated from Rt estimation and join them together
+
+```{r}
+clusters <- read_csv(here('rt_results/country_clusters.csv'))
+
+file_list <- list.files(path = here("rt_results"), pattern = "rt_.*\\.csv", full.names = TRUE)
+names(file_list) <- basename(file_list)
+
+rt_read <- file_list %>%
+  map_dfr(read_csv, .id = "filename") %>%
+  mutate(Country = str_remove_all(filename, "rt_|\\.csv")) %>%
+  mutate(Country = str_replace_all(Country, "_", " "))
+
+rt_with_clusters <- rt_read %>%
+  filter(variable == "R") %>%
+  select(date, Country, median, mean) %>%
+  inner_join(clusters, by = "Country")
+
+rt_with_clusters %>% 
+  ggplot(mapping = aes(x=date, y=median, color = Country)) +
+  geom_line() +
+  facet_wrap(~Cluster)
+```
+As above, we'll see enormous jumps in Rt whenever we have long strings of 0 followed by an increase in the number of excess deaths. We're going to do two things to address that: first, we'll filter our data to:
+
+  1) only include the days after 100 deaths have occurred;
+  2) take a 7 day rolling average to mellow out the dramatic jumps in Rt we see.
+
+```{r}
+rt_smoothed <- rt_with_clusters %>%
+  group_by(Country) %>%
+  arrange(date) %>%
+  mutate(
+    rt_smooth = rollmean(median, k = 7, fill = NA, align = "center")
+  ) %>%
+  ungroup()
+```
+
+Let's have a look now, shall we? 
+
+```{r}
+rt_smoothed %>% 
+  ggplot(mapping = aes(x=date, y=rt_smooth, color = Country)) +
+  geom_line() +
+  facet_wrap(~Cluster)
+```
+
+Uh oh! Even with our smoothing operation, that's too high to be biologically plausible. Additionally, it looks like we've flattened out a lot of the signal. So back to the drawing board - no more smoothing.
+
+We'll need to enforce a later cutoff, too - early jumps in deaths will correspond to large increases in Rt just because we're going from 0 to a small number, creasing false peaks.
+```{r}
+
+start_dates <- prepped_deaths %>%
+  group_by(Country) %>%
+  arrange(date) %>%
+  mutate(cumulative_deaths = cumsum(confirm)) %>% 
+  
+  filter(cumulative_deaths >= 200) %>%
+  slice(1) %>% 
+  
+  mutate(start_date = pmax(date, as.Date("2020-03-15"))) %>%
+  
+  select(Country, start_date) %>%
+  ungroup()
+
+head(start_dates)
+
 ```
 
 
 ```{r}
-deaths_2020 <- deaths_with_countries %>%
-  filter(year(date)<as.Date(2021))
+rt_filtered <- rt_with_clusters %>%
+  inner_join(start_dates, by = "Country") %>%
+  filter(date >= start_date) 
 
-prepped_deaths <- prepare_excess_deaths(deaths_2020)
+rt_filtered %>%
+  ggplot(mapping = aes(x=date, y=median, color = Country)) +
+  geom_line() +
+  facet_wrap(~Cluster)
+```
+Much better. Some of these are still very high, though. The Economist's method works best for high-income and middle-income countries because they have better death reporting in any given year. Unfortunately, we're going to constrain our subsequent analysis to a subset of the original 20 countries as a result. It is simply not biologically plausible that one primary infection causes nearly 20 secondary infections.
 
-write_csv(prepped_deaths, "processed_deaths.csv")
+```{r}
+upper_income <- c('United Kingdom', 
+         'United States',
+         'France', 
+         'Spain',
+         'Poland',
+         'Italy')
 
-?write_csv
+upper_middle_income <- c('Colombia',
+         'Islamic Republic of Iran',
+         'Mexico',
+         'South Africa', 
+         'Brazil') 
 
-process_deaths_by_country <- function(df, cutoff) {
 
-  country_list <- unique(df$Country)
-  dir.create("rt_results", showWarnings = FALSE)
+target_countries <- c(upper_income, upper_middle_income)
+
+
+rt_filtered_countries <- rt_filtered %>%
+  filter(Country %in% target_countries)
+
+rt_filtered_countries %>%
+  ggplot(mapping = aes(x=date, y=median, color = Country)) +
+  geom_line() +
+  facet_wrap(~Cluster)
+```
+Looks pretty good! Now, let's make it a little more fashionable.
+
+```{r}
+rt_filtered %>%
+  filter(Country %in% target_countries) %>%
+  ggplot(mapping = aes(x = date, y = median, color = Country)) +
+  geom_line() +
+  coord_cartesian(ylim = c(0, 10)) + 
+  theme_minimal() +
+  facet_wrap(~ Cluster, ncol = 2) + 
+  labs(
+    title = "COVID-19 Rt Trajectories by Cluster",
+    subtitle = "Comparing transmission patterns across country groups (2020)",
+    y = "Effective Reproduction Number (Rt)",
+    x = NULL
+  )
+```
+
+
+This much more closely resembles the bounds we expect on Rt for the wild variant of COVID-19. Now, let's see what the clustering algorithm picked up on by having a look at the average time series for each cluster.
+```{r}
+
+cluster_means <- rt_filtered_countries %>%
+  group_by(Cluster, date) %>%
+  summarize(median = mean(median, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Cluster = as.factor(Cluster))
+
+ave0 <- rt_filtered_countries %>%
+  filter(Cluster == '0') %>%
+  ggplot(aes(x = date, y = median)) +
+  geom_line(aes(color = Country), alpha = 0.4, size = 0.6) +
+  geom_line(data = filter(cluster_means, Cluster == '0'), 
+            aes(y = median), 
+            color = "black", size = 1.5) +
+  coord_cartesian(ylim = c(0, 5)) +
+  labs(title = "Cluster 0", y = NULL, x = NULL) + # Removed Y label to save space
+  theme_minimal() +
+  theme(legend.position = "none")
+
+
+
+ave1 <- rt_filtered_countries %>%
+  filter(Cluster == '1') %>%
+  ggplot(aes(x = date, y = median)) +
+  geom_line(aes(color = Country), alpha = 0.4, size = 0.6) +
+  geom_line(data = filter(cluster_means, Cluster == '1'), 
+            aes(y = median), 
+            color = "black", size = 1.5) +
+  coord_cartesian(ylim = c(0, 5)) +
+  labs(title = "Cluster 1", y = NULL, x = NULL) + # Removed Y label to save space
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ave2 <- rt_filtered_countries %>%
+  filter(Cluster == '2') %>%
+  ggplot(aes(x = date, y = median)) +
+  geom_line(aes(color = Country), alpha = 0.4, size = 0.6) +
+  geom_line(data = filter(cluster_means, Cluster == '2'), 
+            aes(y = median), 
+            color = "black", size = 1.5) +
+  coord_cartesian(ylim = c(0, 5)) +
+  labs(title = "Cluster 2", y = NULL, x = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ave3 <- rt_filtered_countries %>%
+  filter(Cluster == '3') %>%
+  ggplot(aes(x = date, y = median)) +
+  geom_line(aes(color = Country), alpha = 0.4, size = 0.6) +
+  geom_line(data = filter(cluster_means, Cluster == '3'), 
+            aes(y = median), 
+            color = "black", size = 1.5) +
+  coord_cartesian(ylim = c(0, 5)) +
+  labs(title = "Cluster 3", y = NULL, x = NULL) +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ave0 + ave1 + ave2 + ave3
+```
+
+For a last figure, we'll want to display the number of deaths next to our estimate of Rt for validity. To do that, we're going to revise our initial function to include the confidence intervals around the number of deaths, too.
+```{r}
+
+prepare_excess_deaths_CI <- function(df) {
   
-
-  for(i in 1:cutoff) {
-    current_country <- country_list[i]
-    safe_name <- gsub(" ", "_", current_country)
-    message(paste("Processing", i, "of", cutoff, ":", current_country))
-    file_path <- file.path("rt_results", paste0("rt_", safe_name, ".csv"))
-    if(file.exists(file_path)) {
-      message("  -> Skipping (File exists)")
-      next
-    }
-
-    df_by_country <- df %>%
-      filter(Country == current_country) %>% 
-      select(date, confirm)
+  df_clean <- df %>%
+    arrange(date) %>%
+    group_by(Country) %>%
     
-    if(sum(df_by_country$confirm) < 50) {
-      message("  -> Skipping (Insufficient data)")
-      next 
-    }
+    mutate(
+      daily_total_raw = (estimated_daily_excess_deaths_per_100k * population) / 100000,
+      daily_total_top = (estimated_daily_excess_deaths_ci_95_top_per_100k * population) / 100000,
+      daily_total_bot = (estimated_daily_excess_deaths_ci_95_bot_per_100k * population) / 100000
+    ) %>%
     
-    tryCatch({
-      estimates <- epinow(
-        data = df_by_country,
-        generation_time = generation_time_opts(gen_time),
-        delays = delay_opts(death_delay),
-        rt = rt_opts(prior = LogNormal(mean = 2, sd = 0.2)), ##not confident in prior SD - EpiNow vignette used .2 but seems tight
-        stan = stan_opts(cores = 4),
-        verbose = FALSE
-      )
+    complete(date = seq.Date(min(date), max(date), by = "day")) %>%
+    
+    mutate(
+      daily_total_smooth = na.approx(daily_total_raw, maxgap = 30, na.rm = FALSE),
       
-      summary_df <- estimates$estimates$summarised %>%
-        mutate(Country = current_country)
-      write_csv(summary_df, file_path)
-      
-    }, error = function(e) {
-      message(paste("  -> FAILED on:", current_country))
-      message(e)
-    })
+      daily_top_smooth   = na.approx(daily_total_top, maxgap = 30, na.rm = FALSE),
+      daily_bot_smooth   = na.approx(daily_total_bot, maxgap = 30, na.rm = FALSE)
+    ) %>%
     
-    # Clean RAM
-    gc()
-  }
+    fill(daily_total_smooth, daily_top_smooth, daily_bot_smooth, .direction = "downup") %>%
+    
+    mutate(
+      confirm   = as.integer(pmax(0, ceiling(daily_total_smooth))),
+      lower_CI  = as.integer(pmax(0, floor(daily_bot_smooth))), # Floor for lower bound
+      upper_CI  = as.integer(pmax(0, ceiling(daily_top_smooth))) # Ceiling for upper bound
+    ) %>%
+    
+    select(date, Country, confirm, lower_CI, upper_CI) %>%
+    ungroup()
   
-  message("Batch processing complete.")
+  return(df_clean)
+}
+
+deaths_with_cis <- prepare_excess_deaths_CI(deaths_with_countries)
+
+#That's excess deaths - now let's get the CIs for our rt data!
+
+
+```
+
+Time to plot!
+```{r}
+
+plot_country_dynamics <- function(country_name) {
+
+  p_deaths <- deaths_with_cis %>%
+    filter(Country == country_name) %>%
+    ggplot(aes(x = date)) +
+    geom_ribbon(aes(ymin = lower_CI, ymax = upper_CI), 
+                fill = "grey70", alpha = 0.5) +
+    geom_line(aes(y = confirm), color = "black", size = 0.8) +
+    theme_minimal() +
+    scale_x_date(date_labels = "%b %y", date_breaks = "3 months") +
+    labs(
+      title = paste(country_name, "- Excess Mortality vs. Rt"),
+      subtitle = "A. Daily Excess Deaths (with 95% CI)",
+      y = "Daily Deaths",
+      x = NULL 
+    ) +
+    theme(axis.text.x = element_blank()) 
+
+  p_rt <- rt_read %>%
+    filter(variable == "R") %>%
+    filter(Country == country_name) %>%
+    ggplot(aes(x = date, y = median)) +
+    geom_line() +
+    geom_line(aes(y = median), color = "#0f6674", size = 1) +
+    geom_ribbon(aes(ymin = lower_20, ymax = upper_20), 
+            fill = "#17a2b8", alpha = 0.3) +
+    # The "Critical Threshold" Line
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey30") +
+    # Styling
+    theme_minimal() +
+    coord_cartesian(ylim = c(0, 5)) + # Cap Y-axis to keep spikes from hiding the trend
+    scale_x_date(date_labels = "%b %y", date_breaks = "3 months") +
+
+    # The Rt Confidence Interval (Ribbon)
+      labs(
+      subtitle = "B. Effective Reproduction Number (Rt)",
+      y = "Rt",
+      x = "Date"
+    )
+
+  # --- COMBINE: Stack them vertically ---
+  combined_plot <- p_deaths / p_rt + 
+    plot_layout(heights = c(1, 1)) # Equal height for both panels
+  
+  return(combined_plot)
+}
+
+for (country in target_countries) {
+  print(plot_country_dynamics(country))
 }
 
 
-process_deaths_by_country(prepped_deaths, cutoff = 1)
 
-list.files("rt_results")
-
-afg <- read_csv("~/rt_results/rt_Afghanistan.csv")
-
-View(afg)
-
-rt_results <- afg$estimates$summarised
-
-rt_data <- afg %>% 
-  filter(variable == "R")
-
-head(rt_data)
-
-rt_data %>%
-  ggplot(mapping = aes(x=date, y = mean)) +
-  geom_line()
 ```
 
+I'd also like to see per capita GDP and Rt:
+
+```{r}
+#UN data
+
+dict <- list('United Kingdom' = 49,224, 
+         'United States'= 80,706,
+         'France' = 44,451, 
+         'Spain' = 33,814,
+         'Poland' = 20,876,
+         'Italy' = 38,672,
+         'Colombia' = 6948,
+         'Mexico' = 13826,
+         'South Africa'=5976, 
+         'Brazil'=10378)
+
+GDP <- tibble(dict)
+
+gdp_data <- tibble(
+  Country = c('United Kingdom', 'United States', 'France', 'Spain', 
+              'Poland', 'Italy', 'Colombia', 'Mexico', 'South Africa', 'Brazil'),
+  GDP = c(49224, 80706, 44451, 33814, 20876, 38672, 6948, 13826, 5976, 10378),
+  Cluster = c(1, 0, 1, 3, 1, 3, 0, 0, 1, 2)
+)
+
+gdp_data %>%
+  mutate(
+    Cluster = factor(Cluster),
+    Country = fct_reorder2(Country, Cluster, GDP)
+  ) %>%
+  ggplot(aes(x = Country, y = GDP, fill = Cluster)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(
+    title = "GDP per Capita by Country and Cluster",
+    y = "GDP per Capita (USD)",
+    x = NULL
+  )
+
+```
+
+And let's make an extra heatmap for Rt, for good measure.
+
+```{r}
+rt_filtered %>%
+  filter(Country %in% c("United States", "Mexico", "Colombia")) %>%
+#  summarize(median_rt = median(median, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = date, y = Country, fill = median)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low = "steelblue", 
+    mid = "white", 
+    high = "firebrick",
+    midpoint = 1,
+    name = "Rt",
+    limits = c(0, 4)  # cap for visual clarity
+  ) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid = element_blank()
+  ) +
+  labs(
+    title = "COVID-19 Rt Heatmap by Country",
+    subtitle = "Cluster 0",
+    x = NULL,
+    y = NULL
+  )
+```
+
+### Some extra figures!
+
+An extra US transmission figure, too.
+```{r}
+rt_with_clusters %>%
+  filter(Cluster == 0) %>%
+  ggplot(mapping = aes(x=date, y=mean, color = Country)) +
+  geom_line()
+
+rt_results <- read_csv('/Users/tgbernard19/Desktop/rt-estimates-covid/rt_results/rt_Brazil.csv')
+
+rt_data <- rt_results %>% 
+  filter(variable == "R")
+
+rt_data %>%
+  ggplot(mapping = aes(x=date, y = median)) +
+  geom_line() + 
+    labs(title = "United States: Effective Rate of Transmission vs. Time", x = "Time", y = "Rt ", x = NULL) +
+  theme_light()
+```
+
+AI Disclosure: I used AI for help with some of the file pathing (I've always struggled with absolute and relative paths, and I thought this was an easy way to make sure things were maximally reproducible). My PCA plot for clustering is fairly boiler plate, but I used AI for that as well. I used the tsfresh package in python for that. There's an R version too, but I ran into compatibility issues and kept it in Python on the advice of Charlie Whittaker, a professor in Computational Biology who was a tremendous help in this project.
 
 Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
